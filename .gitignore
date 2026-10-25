@@ -1,0 +1,73 @@
+# --- Secrets & config (never commit these) ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials
+*.tfvars
+
+# --- Data (CSVs are downloaded, not versioned) ---
+data/
+*.csv
+*.parquet
+
+# --- Assignment documents & Office temp/lock files ---
+*.docx
+*.doc
+*.pdf
+~$*
+.~lock.*#
+*.tmp
+
+# --- MLflow local artifacts & tracking DB ---
+mlruns/
+mlartifacts/
+mlflow.db
+*.db
+*.sqlite
+
+# --- Prefect local state ---
+.prefect/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+
+# --- Trained model files (they live in MLflow, not Git) ---
+*.pkl
+*.joblib
+*.h5
+*.pt
+*.onnx
+
+# --- AWS / Elastic Beanstalk ---
+.elasticbeanstalk/*
+!.elasticbeanstalk/*.cfg.yml
+!.elasticbeanstalk/*.global.yml
+
+# --- Docker local overrides ---
+docker-compose.override.yml
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
