@@ -9,6 +9,7 @@ credentials
 
 # --- Data (CSVs are downloaded, not versioned) ---
 data/
+eda_output/
 *.csv
 *.parquet
 
