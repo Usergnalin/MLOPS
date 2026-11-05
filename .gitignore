@@ -8,6 +8,7 @@ credentials
 *.tfvars
 
 # --- Data (CSVs are downloaded, not versioned) ---
+*data/
 data/
 eda_output/
 *.csv
