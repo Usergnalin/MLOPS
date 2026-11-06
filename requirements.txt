@@ -7,16 +7,17 @@ scikit-learn>=1.4
 # imbalanced-learn>=0.12
 
 # --- Experiment tracking ---
-mlflow>=2.14
+mlflow>=3.0
 
-# --- Database (RDS MySQL) ---
+# --- Database (MySQL) ---
 SQLAlchemy>=2.0
 PyMySQL>=1.1
 cryptography>=42.0
 
-# --- Config & HTTP ---
+# --- Config, HTTP & CLI ---
 python-dotenv>=1.0
 requests>=2.31
+tqdm>=4.66
 
 # --- Plotting & notebooks ---
 matplotlib>=3.8

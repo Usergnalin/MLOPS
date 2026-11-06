@@ -6,25 +6,23 @@ Outliers and business-rule oddities (e.g. refund > order value) are NOT touched 
 they are left for the transform / feature-engineering step.
 
 Usage:
-    python src/data_clean.py                      # cleans data/*_base.csv -> clean_data/
-    python src/data_clean.py --postfix batch2     # cleans data/*_batch2.csv
-    python src/data_clean.py --data-dir X --out-dir Y
+    python src/data_clean.py                      # cleans data/raw/*_base.csv -> data/clean/
+    python src/data_clean.py --postfix batch2     # cleans data/raw/*_batch2.csv
+    python src/data_clean.py --raw-dir X --clean-dir Y
 """
 import argparse
 import json
 import logging
-import os
 import re
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from tqdm import tqdm
+
+from config import CLEAN_DIR, RAW_DIR, setup_logging
 
 log = logging.getLogger("data_clean")
-
-ROOT = Path(__file__).resolve().parents[1]
-DATA_DIR = Path(os.environ.get("DATA_DIR", ROOT / "data"))
-CLEAN_DATA_DIR = Path(os.environ.get("CLEAN_DATA_DIR", ROOT / "clean_data"))
 
 # ---------------------------------------------------------------------------
 # Config (mirrors the Config cell in eda.ipynb)
@@ -102,11 +100,11 @@ class Cleaner:
         """Replace a column, counting how many values changed."""
         changed = int((self.df[column] != new_values).sum())
         if changed:
-            self.fixes[f"{column}"] = self.fixes.get(column, 0) + changed
+            self.fixes[column] = self.fixes.get(column, 0) + changed
         self.df[column] = new_values
 
     def reject(self, mask, reason):
-        """Move rows matching mask to the rejects list."""
+        """Move rows matching mask (boolean Series, or ndarray from Index.isin) to the rejects list."""
         mask = pd.Series(mask, index=self.df.index) if isinstance(mask, np.ndarray) else mask
         mask = mask.fillna(False).astype(bool)
         if mask.any():
@@ -263,11 +261,12 @@ def clean_all(customers, orders, labels):
 
     Returns (clean, rejects, fixes): clean is a dict of DataFrames in the raw column layout.
     """
-    cleaners = {
-        "customers": clean_customers(customers),
-        "orders": clean_orders(orders),
-        "labels": clean_labels(labels),
-    }
+    steps = {"customers": (clean_customers, customers), "orders": (clean_orders, orders),
+             "labels": (clean_labels, labels)}
+    cleaners = {}
+    for t in tqdm(TABLE_NAMES, desc="clean tables", unit="table"):
+        clean_fn, df = steps[t]
+        cleaners[t] = clean_fn(df)
     cu, od, lb = (cleaners[t] for t in TABLE_NAMES)
 
     # A label must point to a known order (same country) and a known customer.
@@ -298,15 +297,20 @@ def read_raw(path, table):
     return df[COLUMNS[table]]
 
 
-def run(postfix="base", data_dir=DATA_DIR, out_dir=CLEAN_DATA_DIR):
-    data_dir, out_dir = Path(data_dir), Path(out_dir)
-    raw = {t: read_raw(data_dir / f"{t}_{postfix}.csv", t) for t in TABLE_NAMES}
+def run(postfix="base", raw_dir=RAW_DIR, clean_dir=CLEAN_DIR):
+    """Clean one batch. Returns (clean, rejects, fixes) like clean_all."""
+    raw_dir, clean_dir = Path(raw_dir), Path(clean_dir)
+    paths = {t: raw_dir / f"{t}_{postfix}.csv" for t in TABLE_NAMES}
+    missing = [str(p) for p in paths.values() if not p.exists()]
+    if missing:
+        raise FileNotFoundError(f"raw files not found: {', '.join(missing)}")
+    raw = {t: read_raw(paths[t], t) for t in tqdm(TABLE_NAMES, desc="read raw", unit="table")}
     clean, rejects, fixes = clean_all(raw["customers"], raw["orders"], raw["labels"])
 
-    out_dir.mkdir(parents=True, exist_ok=True)
-    for t in TABLE_NAMES:
-        clean[t].to_csv(out_dir / f"{t}_{postfix}.csv", index=False)
-    rejects.to_csv(out_dir / f"rejects_{postfix}.csv", index=False)
+    clean_dir.mkdir(parents=True, exist_ok=True)
+    outputs = {**clean, "rejects": rejects}
+    for name, df in tqdm(outputs.items(), desc="write clean", unit="file"):
+        df.to_csv(clean_dir / f"{name}_{postfix}.csv", index=False)
 
     for t in TABLE_NAMES:
         n_rej = int((rejects["table"] == t).sum())
@@ -314,15 +318,16 @@ def run(postfix="base", data_dir=DATA_DIR, out_dir=CLEAN_DATA_DIR):
                  t, len(raw[t]), len(clean[t]), n_rej, fixes[t])
     if len(rejects):
         log.info("reject reasons:\n%s", rejects.groupby(["table", "reason"]).size().to_string())
-    log.info("wrote cleaned CSVs to %s", out_dir)
+    log.info("wrote cleaned CSVs to %s", clean_dir)
     return clean, rejects, fixes
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--postfix", default="base", help="batch postfix, e.g. base -> customers_base.csv")
-    parser.add_argument("--data-dir", default=DATA_DIR, help="folder with raw CSVs (env DATA_DIR)")
-    parser.add_argument("--out-dir", default=CLEAN_DATA_DIR, help="folder for cleaned CSVs (env CLEAN_DATA_DIR)")
+    parser.add_argument("--raw-dir", type=Path, default=RAW_DIR, help="folder with raw CSVs (default: %(default)s)")
+    parser.add_argument("--clean-dir", type=Path, default=CLEAN_DIR,
+                        help="folder for cleaned CSVs (default: %(default)s)")
     args = parser.parse_args()
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    run(args.postfix, args.data_dir, args.out_dir)
+    setup_logging()
+    run(args.postfix, args.raw_dir, args.clean_dir)

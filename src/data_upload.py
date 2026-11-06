@@ -1,6 +1,6 @@
-"""Upload cleaned customers / orders / labels CSVs from clean_data/ into the team's MySQL (RDS) database.
+"""Upload cleaned customers / orders / labels CSVs from data/clean/ into the team's MySQL database.
 
-Reads the files written by data_clean.py (clean_data/<table>_<postfix>.csv) and upserts them into
+Reads the files written by data_clean.py (data/clean/<table>_<postfix>.csv) and upserts them into
 three tables that mirror the files. No cleaning is repeated here: each CSV is staged as text and
 MySQL casts the values to proper types on insert, so anything that slipped past cleaning fails
 loudly instead of being silently coerced.
@@ -8,37 +8,27 @@ loudly instead of being silently coerced.
 Re-running a batch is safe (rows are upserted on their primary key). A later batch overwrites a
 customer's snapshot and can update an order's label; batch_id records which batch last wrote a row.
 
-Connection settings come from environment variables (a .env file in the project root is loaded):
-    DB_HOST       RDS endpoint
-    DB_NAME       database name (created if it doesn't exist)
-    DB_USER
-    DB_PASSWORD
-    DB_PORT       optional, default 3306
+Connection settings come from the DB_* variables in .env (see config.py). DB_NAME is created
+if it doesn't exist.
 
 Usage:
-    python src/data_upload.py                      # uploads clean_data/*_base.csv
-    python src/data_upload.py --postfix batch2     # uploads clean_data/*_batch2.csv
+    python src/data_upload.py                      # uploads data/clean/*_base.csv
+    python src/data_upload.py --postfix batch2     # uploads data/clean/*_batch2.csv
     python src/data_upload.py --reset              # drop and recreate the tables first
 """
 import argparse
 import logging
-import os
-import re
 import time
 from pathlib import Path
 
 import pandas as pd
-from dotenv import load_dotenv
-from sqlalchemy import create_engine, text
-from sqlalchemy.engine import URL
+from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
+from tqdm import tqdm
 
-ROOT = Path(__file__).resolve().parents[1]
-load_dotenv(ROOT / ".env")  # before importing data_clean, so its env-based paths also see .env
-
-from data_clean import (  # noqa: E402  (single source of truth for columns, formats and paths)
-    CLEAN_DATA_DIR, COLUMNS, FIRST_ORDER_OUT, ORDER_DATE_OUT, TABLE_NAMES,
-)
+from config import CLEAN_DIR, db_name, make_engine, setup_logging
+# data_clean is the single source of truth for columns and formats.
+from data_clean import COLUMNS, FIRST_ORDER_OUT, ORDER_DATE_OUT, TABLE_NAMES
 
 log = logging.getLogger("data_upload")
 
@@ -152,44 +142,17 @@ def upsert_sql(table):
 # ---------------------------------------------------------------------------
 # Connection
 # ---------------------------------------------------------------------------
-REQUIRED_ENV = ["DB_HOST", "DB_NAME", "DB_USER", "DB_PASSWORD"]
-
-
-def db_url(with_database=True):
-    missing = [k for k in REQUIRED_ENV if not os.environ.get(k)]
-    if missing:
-        raise RuntimeError(f"missing environment variables: {', '.join(missing)} (see .env.example)")
-    name = os.environ["DB_NAME"]
-    if not re.fullmatch(r"\w+", name):
-        raise RuntimeError(f"DB_NAME must be letters, digits or underscores, got {name!r}")
-    return URL.create(
-        "mysql+pymysql",
-        username=os.environ["DB_USER"],
-        password=os.environ["DB_PASSWORD"],
-        host=os.environ["DB_HOST"],
-        port=int(os.environ.get("DB_PORT") or 3306),
-        database=name if with_database else None,
-    )
-
-
-def make_engine(url):
-    return create_engine(url, pool_pre_ping=True,
-                         connect_args={"connect_timeout": 10, "charset": "utf8mb4",
-                                       "local_infile": True})  # allows LOAD DATA LOCAL INFILE
-
-
 def get_engine():
     """Engine for DB_NAME, creating the database on first use."""
-    server = make_engine(db_url(with_database=False))
+    server = make_engine(with_database=False)
     try:
         with server.begin() as conn:
-            conn.execute(text(f"CREATE DATABASE IF NOT EXISTS {q(os.environ['DB_NAME'])} "
-                              "CHARACTER SET utf8mb4"))
+            conn.execute(text(f"CREATE DATABASE IF NOT EXISTS {q(db_name())} CHARACTER SET utf8mb4"))
     except SQLAlchemyError as e:  # e.g. user lacks CREATE privilege but the database already exists
         log.warning("could not ensure database exists (%s); continuing", e.__class__.__name__)
     finally:
         server.dispose()
-    return make_engine(db_url())
+    return make_engine()
 
 
 def ensure_tables(engine, reset=False):
@@ -250,12 +213,12 @@ def stage(engine, table, path):
         except SQLAlchemyError as e:
             raise RuntimeError(
                 f"LOAD DATA LOCAL INFILE failed for {Path(path).name}: {getattr(e, 'orig', e)}. "
-                "If the server disallows local infile, set local_infile=1 in the RDS parameter "
-                "group and reboot the instance."
+                "If the server disallows local infile, enable local_infile on the MySQL server "
+                "(on RDS: set local_infile=1 in the parameter group and reboot the instance)."
             ) from e
 
 
-def run(postfix="base", clean_dir=CLEAN_DATA_DIR, reset=False, engine=None):
+def run(postfix="base", clean_dir=CLEAN_DIR, reset=False, engine=None):
     """Upload one cleaned batch. Returns {table: {"rows", "inserted", "updated"}}."""
     start = time.perf_counter()
     check_schema_matches_clean()
@@ -274,7 +237,8 @@ def run(postfix="base", clean_dir=CLEAN_DATA_DIR, reset=False, engine=None):
         ensure_tables(engine, reset)
 
         # Staging uses DDL (implicit commit in MySQL), so it happens before the transaction.
-        for t in TABLE_NAMES:
+        # LOAD DATA and the upserts report no progress of their own, so the bars count tables.
+        for t in tqdm(TABLE_NAMES, desc="stage (LOAD DATA)", unit="table"):
             staged.append(STAGING_PREFIX + t)
             t0 = time.perf_counter()
             stage(engine, t, paths[t])
@@ -282,7 +246,7 @@ def run(postfix="base", clean_dir=CLEAN_DATA_DIR, reset=False, engine=None):
 
         # All three upserts commit together or not at all; parents before children for FKs.
         with engine.begin() as conn:
-            for t in TABLE_NAMES:
+            for t in tqdm(TABLE_NAMES, desc="upsert", unit="table"):
                 t0 = time.perf_counter()
                 sql = upsert_sql(t)
                 rows = count_rows(conn, STAGING_PREFIX + t)
@@ -303,16 +267,16 @@ def run(postfix="base", clean_dir=CLEAN_DATA_DIR, reset=False, engine=None):
 
     for t, s in stats.items():
         log.info("%-9s rows=%9d  inserted=%9d  updated=%9d", t, s["rows"], s["inserted"], s["updated"])
-    log.info("uploaded postfix '%s' to %s in %.1fs", postfix, os.environ["DB_NAME"],
-             time.perf_counter() - start)
+    log.info("uploaded postfix '%s' to %s in %.1fs", postfix, db_name(), time.perf_counter() - start)
     return stats
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--postfix", default="base", help="batch postfix, e.g. base -> customers_base.csv")
-    parser.add_argument("--clean-dir", default=CLEAN_DATA_DIR, help="folder with cleaned CSVs (env CLEAN_DATA_DIR)")
+    parser.add_argument("--clean-dir", type=Path, default=CLEAN_DIR,
+                        help="folder with cleaned CSVs (default: %(default)s)")
     parser.add_argument("--reset", action="store_true", help="drop and recreate the tables before loading")
     args = parser.parse_args()
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    setup_logging()
     run(args.postfix, args.clean_dir, args.reset)

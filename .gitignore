@@ -7,10 +7,8 @@
 credentials
 *.tfvars
 
-# --- Data (CSVs are downloaded, not versioned) ---
-*data/
+# --- Data (raw CSVs are downloaded, everything else is generated) ---
 data/
-eda_output/
 *.csv
 *.parquet
 

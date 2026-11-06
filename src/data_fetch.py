@@ -3,7 +3,7 @@
 Fetched once per pipeline run; every training script reads the same files through
 load_training_data(), so all models in a run are trained and scored on identical rows.
 
-Writes to TRAIN_DATA_DIR (default <project>/training_data):
+Writes to --training-dir (default data/training/):
     train.csv       training rows (one row per labelled order, joined with its customer)
     test.csv        held-out rows used to score every model
     manifest.json   split rule, row counts, fraud rates, file hashes, batches, fetch time
@@ -15,7 +15,7 @@ orders are split the same way. No order that was ever used for testing leaks int
 
 Usage:
     python src/data_fetch.py
-    python src/data_fetch.py --out-dir X
+    python src/data_fetch.py --training-dir X
 
 In a training script:
     from data_fetch import load_training_data
@@ -33,13 +33,12 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from sqlalchemy import text
+from tqdm import tqdm
 
-from data_upload import db_url, make_engine  # same .env and connection settings as the upload
+from config import TRAINING_DIR, db_name, make_engine, setup_logging
 
 log = logging.getLogger("data_fetch")
 
-ROOT = Path(__file__).resolve().parents[1]
-TRAIN_DATA_DIR = Path(os.environ.get("TRAIN_DATA_DIR", ROOT / "training_data"))
 TRAIN_FILE = "train.csv"
 TEST_FILE = "test.csv"
 MANIFEST_FILE = "manifest.json"
@@ -78,8 +77,10 @@ JOIN labels AS l
     ON l.country_code = o.country_code AND l.order_id = o.order_id
 JOIN customers AS c
     ON c.customer_id = l.customer_id
-ORDER BY o.country_code, o.order_id
 """
+# Same joins, only for the progress bar total.
+COUNT_QUERY = f"SELECT COUNT(*) FROM ({QUERY}) AS q"
+QUERY += "ORDER BY o.country_code, o.order_id\n"
 
 # Column types of the snapshot. Applied after the fetch and again when a CSV is loaded,
 # so training scripts always get the same dtypes.
@@ -126,12 +127,17 @@ def is_test(df):
 
 
 def fetch(engine):
-    with engine.connect().execution_options(stream_results=True) as conn:
-        chunks = pd.read_sql(text(QUERY), conn, chunksize=FETCH_CHUNKSIZE)
-        df = pd.concat(chunks, ignore_index=True)
-    if df.empty:
+    with engine.connect() as conn:
+        total = conn.execute(text(COUNT_QUERY)).scalar_one()
+    if not total:
         raise RuntimeError("no labelled orders in the database - run data_upload.py first")
-    return set_types(df)
+    chunks = []
+    with (engine.connect().execution_options(stream_results=True) as conn,
+          tqdm(total=total, desc="fetch", unit="row", unit_scale=True) as bar):
+        for chunk in pd.read_sql(text(QUERY), conn, chunksize=FETCH_CHUNKSIZE):
+            chunks.append(chunk)
+            bar.update(len(chunk))
+    return set_types(pd.concat(chunks, ignore_index=True))
 
 
 def describe(df, digest):
@@ -146,7 +152,7 @@ def describe(df, digest):
 def build_manifest(df, train, test, train_hash, test_hash):
     return {
         "fetched_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "database": os.environ["DB_NAME"],
+        "database": db_name(),
         "host": os.environ["DB_HOST"],
         "rows": len(df),
         "fraud_rate": round(float(df[TARGET].mean()), 6),
@@ -176,13 +182,13 @@ def write_csv(df, path):
     return file_hash(path)
 
 
-def run(out_dir=TRAIN_DATA_DIR, engine=None):
+def run(training_dir=TRAINING_DIR, engine=None):
     start = time.perf_counter()
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    training_dir = Path(training_dir)
+    training_dir.mkdir(parents=True, exist_ok=True)
 
     own_engine = engine is None
-    engine = engine or make_engine(db_url())
+    engine = engine or make_engine()
     try:
         df = fetch(engine)
     finally:
@@ -195,30 +201,33 @@ def run(out_dir=TRAIN_DATA_DIR, engine=None):
     if train.empty or test.empty or train[TARGET].nunique() < 2 or test[TARGET].nunique() < 2:
         raise RuntimeError("train and test must both be non-empty and contain both classes")
 
-    train_hash = write_csv(train, out_dir / TRAIN_FILE)
-    test_hash = write_csv(test, out_dir / TEST_FILE)
+    with tqdm(total=2, desc="write snapshot", unit="file") as bar:
+        train_hash = write_csv(train, training_dir / TRAIN_FILE)
+        bar.update()
+        test_hash = write_csv(test, training_dir / TEST_FILE)
+        bar.update()
     manifest = build_manifest(df, train, test, train_hash, test_hash)
-    write_atomic(out_dir / MANIFEST_FILE,
+    write_atomic(training_dir / MANIFEST_FILE,
                  lambda p: p.write_text(json.dumps(manifest, indent=2) + "\n"))
 
     for part in ("train", "test"):
         log.info("%-5s rows=%9d  fraud_rate=%.4f", part, manifest[part]["rows"], manifest[part]["fraud_rate"])
     log.info("batches=%s  hash=%s", manifest["batches"], manifest["data_hash"][:12])
-    log.info("wrote %s in %.1fs", out_dir, time.perf_counter() - start)
+    log.info("wrote %s in %.1fs", training_dir, time.perf_counter() - start)
     return train, test, manifest
 
 
-def load_training_data(data_dir=TRAIN_DATA_DIR):
+def load_training_data(training_dir=TRAINING_DIR):
     """For training scripts: returns (train, test, manifest) from the latest fetch."""
-    data_dir = Path(data_dir)
-    manifest_path = data_dir / MANIFEST_FILE
+    training_dir = Path(training_dir)
+    manifest_path = training_dir / MANIFEST_FILE
     if not manifest_path.exists():
-        raise FileNotFoundError(f"no training snapshot in {data_dir} - run data_fetch.py first")
+        raise FileNotFoundError(f"no training snapshot in {training_dir} - run data_fetch.py first")
     manifest = json.loads(manifest_path.read_text())
 
     frames = []
     for part, name in (("train", TRAIN_FILE), ("test", TEST_FILE)):
-        path = data_dir / name
+        path = training_dir / name
         if not path.exists():
             raise FileNotFoundError(f"{path} missing - re-run data_fetch.py")
         if file_hash(path) != manifest[part]["hash"]:
@@ -231,7 +240,8 @@ def load_training_data(data_dir=TRAIN_DATA_DIR):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--out-dir", default=TRAIN_DATA_DIR, help="output folder (env TRAIN_DATA_DIR)")
+    parser.add_argument("--training-dir", type=Path, default=TRAINING_DIR,
+                        help="output folder (default: %(default)s)")
     args = parser.parse_args()
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    run(args.out_dir)
+    setup_logging()
+    run(args.training_dir)
