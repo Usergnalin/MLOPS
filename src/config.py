@@ -69,6 +69,9 @@ def make_engine(with_database=True):
 # ---------------------------------------------------------------------------
 # MLflow
 # ---------------------------------------------------------------------------
+DEFAULT_EXPERIMENT = "sp-buy-fraud"  # MLflow experiment every model logs to unless told otherwise
+
+
 def mlflow_tracking_uri():
     return require_env("MLFLOW_TRACKING_URI")[0]
 

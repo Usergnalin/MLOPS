@@ -33,13 +33,12 @@ from tqdm import tqdm
 SRC = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SRC))  # so the shared src/ modules import when run as a script
 import features  # noqa: E402
-from config import TRAINING_DIR, mlflow_tracking_uri, setup_logging  # noqa: E402
+from config import DEFAULT_EXPERIMENT, TRAINING_DIR, mlflow_tracking_uri, setup_logging  # noqa: E402
 from data_fetch import TARGET, load_training_data  # noqa: E402
 
 log = logging.getLogger("decision_tree_model")
 
 MODEL_TYPE = "decision_tree"
-DEFAULT_EXPERIMENT = "sp-buy-fraud"
 RANDOM_STATE = 42
 SKOPS_TRUSTED_TYPES = ["features.add_features", "sklearn.tree._tree.Tree"]
 
