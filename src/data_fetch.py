@@ -1,14 +1,17 @@
-"""Fetch the joined training dataset from MySQL into a local folder for the training step.
+"""Fetch the joined training dataset from MySQL and split it into train / test files.
 
-Fetched once per pipeline run; every training script reads the same snapshot through
-load_training_data(), so all models in a run are trained on identical data.
+Fetched once per pipeline run; every training script reads the same files through
+load_training_data(), so all models in a run are trained and scored on identical rows.
 
-Writes to TRAIN_DATA_DIR (default <project>/train_data):
-    training_data.csv   one row per labelled order, joined with its customer
-    manifest.json       row count, fraud rate, batches included, file hash, fetch time
+Writes to TRAIN_DATA_DIR (default <project>/training_data):
+    train.csv       training rows (one row per labelled order, joined with its customer)
+    test.csv        held-out rows used to score every model
+    manifest.json   split rule, row counts, fraud rates, file hashes, batches, fetch time
 
-The data is ordered by (country_code, order_id), so the same database contents always give the
-same file and the same data_hash, and seeded train/test splits are reproducible.
+The split is hash-based: an order goes to test when a hash of its (country_code, order_id) falls
+in the lowest TEST_PERCENT of buckets. The assignment depends only on the order itself, so it
+never changes between runs; when new batches arrive, old test orders stay in test and new
+orders are split the same way. No order that was ever used for testing leaks into training.
 
 Usage:
     python src/data_fetch.py
@@ -16,7 +19,7 @@ Usage:
 
 In a training script:
     from data_fetch import load_training_data
-    df, manifest = load_training_data()   # columns already typed (floats, ints, datetimes, bool)
+    train, test, manifest = load_training_data()   # columns already typed
 """
 import argparse
 import hashlib
@@ -27,6 +30,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 from sqlalchemy import text
 
@@ -36,12 +40,18 @@ log = logging.getLogger("data_fetch")
 
 ROOT = Path(__file__).resolve().parents[1]
 TRAIN_DATA_DIR = Path(os.environ.get("TRAIN_DATA_DIR", ROOT / "training_data"))
-DATA_FILE = "training_data.csv"
+TRAIN_FILE = "train.csv"
+TEST_FILE = "test.csv"
 MANIFEST_FILE = "manifest.json"
 FETCH_CHUNKSIZE = 100_000
 DATETIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 TARGET = "is_fraud"
+
+# Split rule. Changing either value reshuffles which orders are test orders, so agree on it
+# as a team and leave it fixed.
+SPLIT_KEY = ["country_code", "order_id"]
+TEST_PERCENT = 20
 
 QUERY = """
 SELECT
@@ -108,6 +118,13 @@ def file_hash(path):
     return h.hexdigest()
 
 
+def is_test(df):
+    """True for test orders. Uses md5 (not Python's hash(), which changes every process)."""
+    keys = df[SPLIT_KEY[0]].str.cat(df[SPLIT_KEY[1:]], sep="|")
+    buckets = [int.from_bytes(hashlib.md5(k.encode()).digest()[:8], "big") % 100 for k in keys]
+    return np.array(buckets) < TEST_PERCENT
+
+
 def fetch(engine):
     with engine.connect().execution_options(stream_results=True) as conn:
         chunks = pd.read_sql(text(QUERY), conn, chunksize=FETCH_CHUNKSIZE)
@@ -117,18 +134,31 @@ def fetch(engine):
     return set_types(df)
 
 
-def build_manifest(df, digest):
+def describe(df, digest):
+    return {
+        "rows": len(df),
+        "fraud_rows": int(df[TARGET].sum()),
+        "fraud_rate": round(float(df[TARGET].mean()), 6),
+        "hash": digest,
+    }
+
+
+def build_manifest(df, train, test, train_hash, test_hash):
     return {
         "fetched_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "database": os.environ["DB_NAME"],
         "host": os.environ["DB_HOST"],
         "rows": len(df),
-        "fraud_rows": int(df[TARGET].sum()),
         "fraud_rate": round(float(df[TARGET].mean()), 6),
         "batches": {str(k): int(v) for k, v in df["batch_id"].value_counts().sort_index().items()},
         "order_date_min": df["order_date"].min().date().isoformat(),
         "order_date_max": df["order_date"].max().date().isoformat(),
-        "data_hash": digest,
+        "split": {"method": "md5 hash of key, bucket % 100 < test_percent",
+                  "key": SPLIT_KEY, "test_percent": TEST_PERCENT},
+        "train": describe(train, train_hash),
+        "test": describe(test, test_hash),
+        # One hash for the whole snapshot, for tagging MLflow runs.
+        "data_hash": hashlib.sha256((train_hash + test_hash).encode()).hexdigest(),
         "columns": list(df.columns),
     }
 
@@ -138,6 +168,12 @@ def write_atomic(path, write):
     tmp = path.with_name(f".{path.name}.tmp")
     write(tmp)
     os.replace(tmp, path)
+
+
+def write_csv(df, path):
+    write_atomic(path, lambda p: df.to_csv(p, index=False, date_format=DATETIME_FORMAT,
+                                           lineterminator="\n"))
+    return file_hash(path)
 
 
 def run(out_dir=TRAIN_DATA_DIR, engine=None):
@@ -154,32 +190,43 @@ def run(out_dir=TRAIN_DATA_DIR, engine=None):
             engine.dispose()
     log.info("fetched %d rows in %.1fs", len(df), time.perf_counter() - start)
 
-    data_path = out_dir / DATA_FILE
-    write_atomic(data_path, lambda p: df.to_csv(p, index=False, date_format=DATETIME_FORMAT,
-                                                lineterminator="\n"))
-    manifest = build_manifest(df, file_hash(data_path))
+    test_mask = is_test(df)
+    train, test = df[~test_mask], df[test_mask]
+    if train.empty or test.empty or train[TARGET].nunique() < 2 or test[TARGET].nunique() < 2:
+        raise RuntimeError("train and test must both be non-empty and contain both classes")
+
+    train_hash = write_csv(train, out_dir / TRAIN_FILE)
+    test_hash = write_csv(test, out_dir / TEST_FILE)
+    manifest = build_manifest(df, train, test, train_hash, test_hash)
     write_atomic(out_dir / MANIFEST_FILE,
                  lambda p: p.write_text(json.dumps(manifest, indent=2) + "\n"))
 
-    log.info("rows=%d  fraud_rate=%.4f  batches=%s  hash=%s",
-             manifest["rows"], manifest["fraud_rate"], manifest["batches"], manifest["data_hash"][:12])
-    log.info("wrote %s in %.1fs", data_path, time.perf_counter() - start)
-    return df, manifest
+    for part in ("train", "test"):
+        log.info("%-5s rows=%9d  fraud_rate=%.4f", part, manifest[part]["rows"], manifest[part]["fraud_rate"])
+    log.info("batches=%s  hash=%s", manifest["batches"], manifest["data_hash"][:12])
+    log.info("wrote %s in %.1fs", out_dir, time.perf_counter() - start)
+    return train, test, manifest
 
 
 def load_training_data(data_dir=TRAIN_DATA_DIR):
-    """For training scripts: returns (DataFrame, manifest) from the latest fetch."""
+    """For training scripts: returns (train, test, manifest) from the latest fetch."""
     data_dir = Path(data_dir)
-    data_path, manifest_path = data_dir / DATA_FILE, data_dir / MANIFEST_FILE
-    if not data_path.exists() or not manifest_path.exists():
+    manifest_path = data_dir / MANIFEST_FILE
+    if not manifest_path.exists():
         raise FileNotFoundError(f"no training snapshot in {data_dir} - run data_fetch.py first")
     manifest = json.loads(manifest_path.read_text())
-    if file_hash(data_path) != manifest["data_hash"]:
-        raise RuntimeError(f"{DATA_FILE} does not match {MANIFEST_FILE} (hash differs); "
-                           "re-run data_fetch.py")
-    df = pd.read_csv(data_path, dtype=DTYPES, parse_dates=DATETIME_COLUMNS,
-                     date_format=DATETIME_FORMAT)
-    return df, manifest
+
+    frames = []
+    for part, name in (("train", TRAIN_FILE), ("test", TEST_FILE)):
+        path = data_dir / name
+        if not path.exists():
+            raise FileNotFoundError(f"{path} missing - re-run data_fetch.py")
+        if file_hash(path) != manifest[part]["hash"]:
+            raise RuntimeError(f"{name} does not match {MANIFEST_FILE} (hash differs); "
+                               "re-run data_fetch.py")
+        frames.append(pd.read_csv(path, dtype=DTYPES, parse_dates=DATETIME_COLUMNS,
+                                  date_format=DATETIME_FORMAT))
+    return frames[0], frames[1], manifest
 
 
 if __name__ == "__main__":
