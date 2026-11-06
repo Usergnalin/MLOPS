@@ -1,14 +1,9 @@
 """Decision tree fraud classifier.
 
 Reads the snapshot written by data_fetch.py, trains one sklearn Pipeline (minimal preprocessing +
-DecisionTreeClassifier) and logs params, metrics and the model to the MLflow server.
-Because preprocessing is inside the Pipeline, the logged model takes raw snapshot columns.
-
-Env vars (the project .env is loaded via data_fetch):
-    MLFLOW_TRACKING_URI      required, e.g. http://<your-eb-env>.elasticbeanstalk.com
-    MLFLOW_EXPERIMENT_NAME   optional, default "sp-buy-fraud"
-    PIPELINE_RUN_ID          optional; set by pipeline.py so every run of one ETL run shares a prefix
-    MODEL_AUTHOR             optional, default: your OS user name
+DecisionTreeClassifier) and logs params, metrics and the model to the MLflow server
+(MLFLOW_TRACKING_URI in .env). Because preprocessing is inside the Pipeline, the logged model
+takes raw snapshot columns.
 
 Usage:
     python src/models/decision_tree_model.py
@@ -17,7 +12,6 @@ Usage:
 import argparse
 import getpass
 import logging
-import os
 import sys
 import time
 from datetime import datetime
@@ -34,36 +28,32 @@ from sklearn.metrics import (
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import FunctionTransformer, OneHotEncoder
 from sklearn.tree import DecisionTreeClassifier
+from tqdm import tqdm
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # src/, for data_fetch
-from data_fetch import TARGET, load_training_data  # noqa: E402  (also loads .env)
+SRC = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(SRC))  # so the shared src/ modules import when run as a script
+import features  # noqa: E402
+from config import TRAINING_DIR, mlflow_tracking_uri, setup_logging  # noqa: E402
+from data_fetch import TARGET, load_training_data  # noqa: E402
 
 log = logging.getLogger("decision_tree_model")
 
 MODEL_TYPE = "decision_tree"
+DEFAULT_EXPERIMENT = "sp-buy-fraud"
 RANDOM_STATE = 42
+SKOPS_TRUSTED_TYPES = ["features.add_features", "sklearn.tree._tree.Tree"]
 
 CATEGORICAL = ["country_code", "collect_type", "payment_method"]
 NUMERIC = [
     "order_value", "num_items_ordered", "refund_value", "mobile_verified",
     "num_orders_last_50days", "num_cancelled_orders_last_50days", "num_refund_orders_last_50days",
     "total_payment_last_50days", "num_associated_customers",
-    "account_age_days",  # created by add_features
+    "account_age_days",  # created by features.add_features
 ]
 # Raw snapshot columns the model takes as input (IDs and batch_id are deliberately left out).
 INPUT_COLUMNS = CATEGORICAL + [c for c in NUMERIC if c != "account_age_days"] + [
     "order_date", "first_order_datetime",
 ]
-
-
-def add_features(X):
-    """Minimal feature engineering, kept inside the Pipeline so scoring uses the same code."""
-    X = X.copy()
-    # How old the account was when the order was placed; -1 when first_order_datetime is unknown
-    # (a tree can split that value off on its own).
-    X["account_age_days"] = (X["order_date"] - X["first_order_datetime"]).dt.days.fillna(-1)
-    X["mobile_verified"] = X["mobile_verified"].astype(int)
-    return X
 
 
 def build_model(max_depth, min_samples_leaf):
@@ -83,7 +73,8 @@ def build_model(max_depth, min_samples_leaf):
         random_state=RANDOM_STATE,
     )
     return Pipeline([
-        ("features", FunctionTransformer(add_features)),
+        # Feature engineering inside the Pipeline, so scoring uses the same code.
+        ("features", FunctionTransformer(features.add_features)),
         ("preprocess", preprocess),
         ("model", tree),
     ])
@@ -103,22 +94,27 @@ def evaluate(y_true, y_pred, y_proba, prefix):
     }
 
 
-def run(max_depth=8, min_samples_leaf=50):
-    if not os.environ.get("MLFLOW_TRACKING_URI"):
-        raise RuntimeError("MLFLOW_TRACKING_URI is not set (see .env.example)")
+def run(max_depth=8, min_samples_leaf=50, training_dir=TRAINING_DIR, experiment=DEFAULT_EXPERIMENT,
+        pipeline_run_id=None, author=None):
+    """Train, evaluate and log one model. Returns (mlflow_run_id, metrics).
+
+    pipeline_run_id prefixes the MLflow run name so all models of one pipeline run group together.
+    """
+    mlflow.set_tracking_uri(mlflow_tracking_uri())
 
     # The train/test split is fixed by data_fetch, so every model is scored on the same rows.
-    train, test, manifest = load_training_data()
+    train, test, manifest = load_training_data(training_dir)
     X_train, y_train = train[INPUT_COLUMNS], train[TARGET]
     X_test, y_test = test[INPUT_COLUMNS], test[TARGET]
 
-    pipeline_run_id = os.environ.get("PIPELINE_RUN_ID") or datetime.now().strftime("%Y%m%d-%H%M%S")
-    mlflow.set_experiment(os.environ.get("MLFLOW_EXPERIMENT_NAME", "sp-buy-fraud"))
+    pipeline_run_id = pipeline_run_id or datetime.now().strftime("%Y%m%d-%H%M%S")
+    mlflow.set_experiment(experiment)
 
-    with mlflow.start_run(run_name=f"{pipeline_run_id}_{MODEL_TYPE}") as run:
+    steps = tqdm(total=3, desc=MODEL_TYPE, unit="step")
+    with steps, mlflow.start_run(run_name=f"{pipeline_run_id}_{MODEL_TYPE}") as run:
         mlflow.set_tags({
             "model_type": MODEL_TYPE,
-            "author": os.environ.get("MODEL_AUTHOR") or getpass.getuser(),
+            "author": author or getpass.getuser(),
             "pipeline_run_id": pipeline_run_id,
             "data_hash": manifest["data_hash"],
             "data_batches": ",".join(manifest["batches"]),
@@ -138,11 +134,14 @@ def run(max_depth=8, min_samples_leaf=50):
         })
 
         model = build_model(max_depth, min_samples_leaf)
+        steps.set_postfix_str("fit")
         start = time.perf_counter()
         model.fit(X_train, y_train)
         mlflow.log_metric("train_seconds", time.perf_counter() - start)
+        steps.update()
 
         # Train metrics alongside test metrics make over/underfitting visible in the MLflow UI.
+        steps.set_postfix_str("evaluate")
         metrics = evaluate(y_train, model.predict(X_train), model.predict_proba(X_train)[:, 1], "train")
         test_pred = model.predict(X_test)
         metrics |= evaluate(y_test, test_pred, model.predict_proba(X_test)[:, 1], "test")
@@ -154,12 +153,19 @@ def run(max_depth=8, min_samples_leaf=50):
             {n: round(float(v), 6) for n, v in sorted(zip(names, importances), key=lambda p: -p[1])},
             "feature_importances.json",
         )
+        steps.update()
 
+        steps.set_postfix_str("log model")
         mlflow.sklearn.log_model(
-            model, "model",
-            signature=infer_signature(X_test.head(100), test_pred[:100]),
+            model, name="model",
+            # Inferred on all test rows so rare nulls (first_order_datetime) are marked optional.
+            signature=infer_signature(X_test, test_pred),
             input_example=X_test.head(5),
+            code_paths=[features.__file__],  # the Pipeline references features.add_features
+            # MLflow saves sklearn models with skops, which only loads types listed here.
+            skops_trusted_types=SKOPS_TRUSTED_TYPES,
         )
+        steps.update()
 
     log.info("run %s  test: f1=%.4f precision=%.4f recall=%.4f roc_auc=%.4f pr_auc=%.4f",
              run.info.run_id, metrics["test_f1"], metrics["test_precision"],
@@ -171,6 +177,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--max-depth", type=int, default=8)
     parser.add_argument("--min-samples-leaf", type=int, default=50)
+    parser.add_argument("--training-dir", type=Path, default=TRAINING_DIR,
+                        help="snapshot written by data_fetch.py (default: %(default)s)")
+    parser.add_argument("--experiment", default=DEFAULT_EXPERIMENT, help="MLflow experiment name")
+    parser.add_argument("--run-id", help="pipeline run id used as MLflow run name prefix (default: timestamp)")
+    parser.add_argument("--author", help="author tag (default: OS user name)")
     args = parser.parse_args()
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    run(args.max_depth, args.min_samples_leaf)
+    setup_logging()
+    run(args.max_depth, args.min_samples_leaf, args.training_dir, args.experiment, args.run_id, args.author)
