@@ -219,7 +219,10 @@ def stage(engine, table, path):
 
 
 def run(postfix="base", clean_dir=CLEAN_DIR, reset=False, engine=None):
-    """Upload one cleaned batch. Returns {table: {"rows", "inserted", "updated"}}."""
+    """Upload one cleaned batch. Returns {table: {"rows", "inserted", "existing"}}.
+
+    "existing" rows were already in the table and got upserted, whether or not a value changed.
+    """
     start = time.perf_counter()
     check_schema_matches_clean()
     clean_dir = Path(clean_dir)
@@ -253,7 +256,7 @@ def run(postfix="base", clean_dir=CLEAN_DIR, reset=False, engine=None):
                 before = count_rows(conn, t)
                 conn.execute(text(sql), {k: v for k, v in params.items() if f":{k}" in sql})
                 inserted = count_rows(conn, t) - before
-                stats[t] = {"rows": rows, "inserted": inserted, "updated": rows - inserted}
+                stats[t] = {"rows": rows, "inserted": inserted, "existing": rows - inserted}
                 log.info("upserted  %-9s in %6.1fs", t, time.perf_counter() - t0)
     finally:
         try:
@@ -266,7 +269,7 @@ def run(postfix="base", clean_dir=CLEAN_DIR, reset=False, engine=None):
             engine.dispose()
 
     for t, s in stats.items():
-        log.info("%-9s rows=%9d  inserted=%9d  updated=%9d", t, s["rows"], s["inserted"], s["updated"])
+        log.info("%-9s rows=%9d  inserted=%9d  existing=%9d", t, s["rows"], s["inserted"], s["existing"])
     log.info("uploaded postfix '%s' to %s in %.1fs", postfix, db_name(), time.perf_counter() - start)
     return stats
 
